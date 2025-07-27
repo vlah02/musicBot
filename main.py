@@ -12,6 +12,7 @@ import datetime
 import random
 
 def make_progress_bar(elapsed: float, total: float, length: int = 20) -> str:
+    """Return a text bar like '████░░░░░ 01:23/03:45'"""
     filled = int(elapsed / total * length)
     empty = length - filled
     bar = "█" * filled + "░" * empty
@@ -39,6 +40,7 @@ def run_bot():
     current_song     = {}  # guild_id -> song
     song_start_times = {}  # guild_id -> datetime
     loop_status      = {}  # guild_id -> bool
+    last_np_message  = {}  # guild_id -> message_id
 
     youtube_base_url    = "https://www.youtube.com/"
     youtube_results_url = youtube_base_url + "results?"
@@ -101,7 +103,7 @@ def run_bot():
         if not vc:
             try:
                 await msg.remove_reaction(reaction.emoji, user)
-            except discord.Forbidden:
+            except (discord.Forbidden, discord.NotFound):
                 pass
             return
 
@@ -114,15 +116,17 @@ def run_bot():
         else:  # ➡️ skip
             vc.stop()
             await msg.channel.send("➡️ Skipped current song.")
-            # **NEW**: delete the old Now Playing embed so it can no longer be used
+            # delete this old embed so it can't be used again
             try:
                 await msg.delete()
-            except discord.Forbidden:
+            except (discord.Forbidden, discord.NotFound):
                 pass
+            return  # stop here so we don't try to remove reactions on deleted message
 
+        # if pause/play, clear the reaction
         try:
             await msg.remove_reaction(reaction.emoji, user)
-        except discord.Forbidden:
+        except (discord.Forbidden, discord.NotFound):
             pass
 
     async def play_song(ctx, song):
@@ -154,14 +158,24 @@ def run_bot():
         current_song[ctx.guild.id]     = song
         song_start_times[ctx.guild.id] = datetime.datetime.now()
 
+        # before posting, delete previous NP embed if any
+        prev = last_np_message.get(ctx.guild.id)
+        if prev:
+            try:
+                old = await ctx.fetch_message(prev)
+                await old.delete()
+            except:
+                pass
+
         embed = discord.Embed(title="Now Playing", color=discord.Color.green())
         embed.add_field(name="Title", value=f"[{song['title']}]({song['url']})", inline=False)
         embed.add_field(name="Duration", value=str(datetime.timedelta(seconds=song["duration"])), inline=False)
         embed.add_field(name="Requested by", value=song["user"], inline=False)
         embed.set_thumbnail(url=song["thumbnail"])
         msg = await ctx.send(embed=embed)
-        for emoji in ("⏸️", "▶️", "➡️"):
+        for emoji in ("⏸️","▶️","➡️"):
             await msg.add_reaction(emoji)
+        last_np_message[ctx.guild.id] = msg.id
 
     async def handle_queue(ctx):
         q = queues.get(ctx.guild.id)
@@ -413,12 +427,24 @@ def run_bot():
         start = song_start_times.get(ctx.guild.id)
         if not song or not start:
             return await ctx.send(embed=discord.Embed(
-                title="Now Playing", description="No song is currently playing.", color=discord.Color.red()
+                title="Now Playing",
+                description="No song is currently playing.",
+                color=discord.Color.red()
             ))
+
         total = song["duration"]
         elapsed = (datetime.datetime.now() - start).total_seconds()
         if elapsed > total:
             elapsed = total
+
+        # delete any previous NP embed
+        prev = last_np_message.get(ctx.guild.id)
+        if prev:
+            try:
+                old = await ctx.fetch_message(prev)
+                await old.delete()
+            except:
+                pass
 
         embed = discord.Embed(title="Now Playing", color=discord.Color.green())
         embed.add_field(name="Title", value=f"[{song['title']}]({song['url']})", inline=False)
@@ -427,8 +453,10 @@ def run_bot():
         embed.add_field(name="Progress", value=make_progress_bar(elapsed, total), inline=False)
         embed.set_thumbnail(url=song["thumbnail"])
         msg = await ctx.send(embed=embed)
-        for emoji in ("⏸️","▶️","➡️"):
+        for emoji in ("⏸️", "▶️", "➡️"):
             await msg.add_reaction(emoji)
+
+        last_np_message[ctx.guild.id] = msg.id
 
     @client.command(name="lyrics")
     @commands.has_role(ROLE_NAME)
