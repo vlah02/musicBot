@@ -27,7 +27,7 @@ def run_bot():
     load_dotenv()
     DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
     GENIUS_TOKEN  = os.getenv("GENIUS_TOKEN")
-    ROLE_NAME     = "DJ"
+    ROLE_NAME     = os.getenv("ROLE_NAME")
     RESTRICTED_UID= 123456789012345678
 
     intents = discord.Intents.default()
