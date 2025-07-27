@@ -7,6 +7,7 @@ import lyricsgenius
 from dotenv import load_dotenv
 import urllib.parse, urllib.request, re
 import datetime
+import random
 
 def run_bot():
     load_dotenv()
@@ -520,6 +521,85 @@ def run_bot():
             )
 
         await ctx.send(embed=embed)
+
+    @client.command(name="search")
+    @commands.has_role(ROLE_NAME)
+    async def search(ctx, *, keywords):
+        # Perform a “ytsearch5:” lookup
+        data = ytdl.extract_info(f"ytsearch5:{keywords}", download=False)
+        entries = data.get("entries", [])
+        if not entries:
+            return await ctx.send("No results found.")
+
+        # Build embed with 1–5 choices, safely grabbing a URL
+        descriptions = []
+        for i, e in enumerate(entries, start=1):
+            url = e.get("webpage_url") or e.get("url") or (youtube_watch_url + e.get("id", ""))
+            title = e.get("title", "Unknown title")
+            descriptions.append(f"{i}. [{title}]({url})")
+
+        em = discord.Embed(
+            title=f"Results for “{keywords}”",
+            description="\n".join(descriptions),
+            color=discord.Color.gold()
+        )
+        msg = await ctx.send(embed=em)
+
+        emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
+        for i in range(len(entries)):
+            await msg.add_reaction(emojis[i])
+
+        def check(reaction, user):
+            return (
+                user == ctx.author
+                and reaction.message.id == msg.id
+                and reaction.emoji in emojis[:len(entries)]
+            )
+
+        try:
+            reaction, user = await client.wait_for("reaction_add", timeout=30.0, check=check)
+        except asyncio.TimeoutError:
+            return await ctx.send("❌ Selection timed out.")
+
+        idx = emojis.index(reaction.emoji)
+        pick = entries[idx]
+        pick_url = pick.get("webpage_url") or pick.get("url") or (youtube_watch_url + pick.get("id", ""))
+
+        song = {
+            'title': pick.get('title', 'Unknown'),
+            'url': pick_url,
+            'duration': pick.get('duration', 0),
+            'thumbnail': pick.get('thumbnail'),
+            'user': ctx.author.display_name
+        }
+
+        gid = ctx.guild.id
+        q = queues.setdefault(gid, [])
+        vc = voice_clients.get(gid)
+        if vc and vc.is_connected() and vc.is_playing():
+            q.append(song)
+            return await ctx.send(f"✅ Queued **{song['title']}** at position {len(q)}.")
+        else:
+            vc = await ctx.author.voice.channel.connect()
+            voice_clients[gid] = vc
+            await play_song(ctx, song)
+
+    @client.command(name="shuffle")
+    @commands.has_role(ROLE_NAME)
+    async def shuffle_cmd(ctx):
+        q = queues.get(ctx.guild.id)
+        if not q:
+            return await ctx.send(embed=discord.Embed(
+                title="Error",
+                description="Queue empty.",
+                color=discord.Color.red()
+            ))
+        random.shuffle(q)
+        await ctx.send(embed=discord.Embed(
+            title="🔀 Shuffled",
+            description="Queue order randomized!",
+            color=discord.Color.purple()
+        ))
 
     client.run(DISCORD_TOKEN)
 
