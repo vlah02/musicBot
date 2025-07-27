@@ -35,12 +35,12 @@ def run_bot():
     intents.voice_states    = True
     client = commands.Bot(command_prefix="!", intents=intents)
 
-    queues           = {}  # guild_id -> list[song]
-    voice_clients    = {}  # guild_id -> VoiceClient
-    current_song     = {}  # guild_id -> song
-    song_start_times = {}  # guild_id -> datetime
-    loop_status      = {}  # guild_id -> bool
-    last_np_message  = {}  # guild_id -> message_id
+    queues           = {}
+    voice_clients    = {}
+    current_song     = {}
+    song_start_times = {}
+    loop_status      = {}
+    last_np_message  = {}
 
     youtube_base_url    = "https://www.youtube.com/"
     youtube_results_url = youtube_base_url + "results?"
@@ -113,17 +113,15 @@ def run_bot():
         elif reaction.emoji == "▶️":
             vc.resume()
             await msg.channel.send("▶️ Resumed playback.")
-        else:  # ➡️ skip
+        else:
             vc.stop()
             await msg.channel.send("➡️ Skipped current song.")
-            # delete this old embed so it can't be used again
             try:
                 await msg.delete()
             except (discord.Forbidden, discord.NotFound):
                 pass
-            return  # stop here so we don't try to remove reactions on deleted message
+            return
 
-        # if pause/play, clear the reaction
         try:
             await msg.remove_reaction(reaction.emoji, user)
         except (discord.Forbidden, discord.NotFound):
@@ -158,7 +156,6 @@ def run_bot():
         current_song[ctx.guild.id]     = song
         song_start_times[ctx.guild.id] = datetime.datetime.now()
 
-        # before posting, delete previous NP embed if any
         prev = last_np_message.get(ctx.guild.id)
         if prev:
             try:
@@ -449,7 +446,6 @@ def run_bot():
         if elapsed > total:
             elapsed = total
 
-        # delete any previous NP embed
         prev = last_np_message.get(ctx.guild.id)
         if prev:
             try:
