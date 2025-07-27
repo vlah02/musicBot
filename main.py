@@ -445,22 +445,17 @@ def run_bot():
         vc = voice_clients.get(ctx.guild.id)
         if vc and vc.is_playing():
             vc.stop()
-            await ctx.send(
-                embed=discord.Embed(
-                    title="Skipped",
-                    description="Skipped current song.",
-                    color=discord.Color.orange(),
-                )
-            )
-            await handle_queue(ctx)
+            await ctx.send(embed=discord.Embed(
+                title="Skipped",
+                description="Skipped current song.",
+                color=discord.Color.orange()
+            ))
         else:
-            await ctx.send(
-                embed=discord.Embed(
-                    title="Error",
-                    description="No song is currently playing.",
-                    color=discord.Color.red(),
-                )
-            )
+            await ctx.send(embed=discord.Embed(
+                title="Error",
+                description="No song is currently playing.",
+                color=discord.Color.red()
+            ))
 
     @client.command(name="queue", aliases=["q"])
     @commands.has_role(ROLE_NAME)
