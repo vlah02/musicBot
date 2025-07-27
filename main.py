@@ -16,6 +16,7 @@ def run_bot():
     RESTRICTED_USER_ID = 123456789012345678
     intents = discord.Intents.default()
     intents.message_content = True
+    intents.voice_states = True
     client = commands.Bot(command_prefix="!", intents=intents)
 
     queues = {}
@@ -45,12 +46,33 @@ def run_bot():
     async def on_ready():
         print(f'{client.user} is now jamming')
 
+    @client.event
+    async def on_voice_state_update(member, before, after):
+        # If the bot itself was disconnected, clean up and stop any playback
+        if member == client.user:
+            if before.channel is not None and after.channel is None:
+                guild_id = before.channel.guild.id
+                print(f"[INFO] Bot was disconnected from voice channel in guild {guild_id}")
+                # Pop and stop any hanging voice client
+                vc = voice_clients.pop(guild_id, None)
+                if vc:
+                    vc.stop()
+                # Remove song state
+                current_song.pop(guild_id, None)
+                song_start_times.pop(guild_id, None)
+
     async def play_song(ctx, song):
         try:
-            data = await asyncio.get_event_loop().run_in_executor(None, lambda: ytdl.extract_info(song['url'], download=False))
+            data = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ytdl.extract_info(song['url'], download=False)
+            )
         except Exception as e:
             print(f"Error extracting info: {e}")
-            embed = discord.Embed(title="Error", description="There was an error extracting the video information.", color=discord.Color.red())
+            embed = discord.Embed(
+                title="Error",
+                description="There was an error extracting the video information.",
+                color=discord.Color.red()
+            )
             await ctx.send(embed=embed)
             return
 
@@ -58,10 +80,13 @@ def run_bot():
         player = discord.FFmpegOpusAudio(song_url, **ffmpeg_options)
 
         def after_playing(err):
-            if ctx.guild.id in loop_status and loop_status[ctx.guild.id]:
-                asyncio.run_coroutine_threadsafe(play_song(ctx, song), client.loop)
-            else:
-                asyncio.run_coroutine_threadsafe(handle_queue(ctx), client.loop)
+            vc = voice_clients.get(ctx.guild.id)
+            # If disconnected, bail out
+            if vc is None or not vc.is_connected():
+                return
+            # Decide whether to loop or handle queue
+            coro = play_song(ctx, song) if loop_status.get(ctx.guild.id) else handle_queue(ctx)
+            asyncio.run_coroutine_threadsafe(coro, client.loop)
 
         voice_clients[ctx.guild.id].play(player, after=after_playing)
 
@@ -76,7 +101,7 @@ def run_bot():
         await ctx.send(embed=embed)
 
     async def handle_queue(ctx):
-        if queues[ctx.guild.id]:
+        if queues.get(ctx.guild.id):
             next_song = queues[ctx.guild.id].pop(0)
             await play_song(ctx, next_song)
         else:
@@ -88,13 +113,21 @@ def run_bot():
             del voice_clients[ctx.guild.id]
         if ctx.guild.id in current_song:
             del current_song[ctx.guild.id]
-        embed = discord.Embed(title="Disconnected", description="The queue is empty. The bot has disconnected.", color=discord.Color.red())
+        embed = discord.Embed(
+            title="Disconnected",
+            description="The queue is empty. The bot has disconnected.",
+            color=discord.Color.red()
+        )
         await ctx.send(embed=embed)
 
     @client.before_invoke
     async def check_restricted_user(ctx):
         if ctx.author.id == RESTRICTED_USER_ID:
-            embed = discord.Embed(title="Access Denied", description="You are restricted from using this command.", color=discord.Color.red())
+            embed = discord.Embed(
+                title="Access Denied",
+                description="You are restricted from using this command.",
+                color=discord.Color.red()
+            )
             await ctx.send(embed=embed)
             raise commands.CheckFailure("Restricted user")
 
@@ -105,6 +138,7 @@ def run_bot():
             queues[ctx.guild.id] = []
 
         if link is None:
+            # Resume or show empty queue
             if queues[ctx.guild.id]:
                 if ctx.guild.id in voice_clients and voice_clients[ctx.guild.id].is_connected():
                     if not voice_clients[ctx.guild.id].is_playing():
@@ -123,6 +157,7 @@ def run_bot():
                 await ctx.send(embed=embed)
             return
 
+        # Search if not a direct YouTube URL
         if youtube_base_url not in link:
             query_string = urllib.parse.urlencode({'search_query': link})
             content = urllib.request.urlopen(youtube_results_url + query_string)
@@ -134,7 +169,11 @@ def run_bot():
             data = await loop.run_in_executor(None, lambda: ytdl.extract_info(link, download=False))
         except Exception as e:
             print(f"Error extracting info: {e}")
-            embed = discord.Embed(title="Error", description="There was an error extracting the video information.", color=discord.Color.red())
+            embed = discord.Embed(
+                title="Error",
+                description="There was an error extracting the video information.",
+                color=discord.Color.red()
+            )
             await ctx.send(embed=embed)
             return
 
@@ -152,10 +191,10 @@ def run_bot():
             'user': user
         }
 
+        # Queue or play immediately
         if ctx.guild.id in voice_clients and voice_clients[ctx.guild.id].is_connected():
             if voice_clients[ctx.guild.id].is_playing():
                 queues[ctx.guild.id].append(song)
-
                 elapsed_time = datetime.datetime.now() - song_start_times[ctx.guild.id]
                 remaining_time = current_song[ctx.guild.id]['duration'] - elapsed_time.total_seconds()
                 cumulative_time = sum(s['duration'] for s in queues[ctx.guild.id]) + remaining_time
@@ -242,11 +281,7 @@ def run_bot():
     @client.command(name="loop")
     @commands.has_role(ROLE_NAME)
     async def loop(ctx):
-        if ctx.guild.id in loop_status:
-            loop_status[ctx.guild.id] = not loop_status[ctx.guild.id]
-        else:
-            loop_status[ctx.guild.id] = True
-
+        loop_status[ctx.guild.id] = not loop_status.get(ctx.guild.id, False)
         status = "enabled" if loop_status[ctx.guild.id] else "disabled"
         embed = discord.Embed(title="Loop", description=f"Looping is now {status}.", color=discord.Color.purple())
         await ctx.send(embed=embed)
@@ -265,7 +300,6 @@ def run_bot():
                 queue_list += f"{i + 1}. [{song['title']}]({song['url']}) - {str(datetime.timedelta(seconds=song['duration']))}\n"
                 queue_list += f"Added by: {song['user']}\n"
                 queue_list += f"Time until played: {formatted_cumulative_time}\n"
-
             embed = discord.Embed(title="Current Queue", description=queue_list, color=discord.Color.blue())
             await ctx.send(embed=embed)
         else:
@@ -283,10 +317,8 @@ def run_bot():
         try:
             if ctx.guild.id in voice_clients and voice_clients[ctx.guild.id].is_playing():
                 voice_clients[ctx.guild.id].stop()
-
                 embed = discord.Embed(title="Skipped", description="The current song has been skipped.", color=discord.Color.orange())
                 await ctx.send(embed=embed)
-
                 await handle_queue(ctx)
             else:
                 embed = discord.Embed(title="Error", description="There is no song currently playing.", color=discord.Color.red())
@@ -336,47 +368,85 @@ def run_bot():
             embed = discord.Embed(title="Error", description="No song is currently playing.", color=discord.Color.red())
             await ctx.send(embed=embed)
 
-    @client.command(name="cmds")
-    async def cmds(ctx):
-        embed = discord.Embed(title="Help", description="List of commands", color=discord.Color.blue())
-        embed.add_field(name="!play [link]", value="Plays the specified song or resumes the queue if no link is provided.", inline=False)
-        embed.add_field(name="!p [link]", value="Alias for !play.", inline=False)
-        embed.add_field(name="!clear", value="Clears the current queue.", inline=False)
-        embed.add_field(name="!pause", value="Pauses the current song.", inline=False)
-        embed.add_field(name="!resume", value="Resumes the paused song.", inline=False)
-        embed.add_field(name="!stop", value="Stops the current song and clears the queue.", inline=False)
-        embed.add_field(name="!fuckoff", value="Alias for !stop.", inline=False)
-        embed.add_field(name="!kys", value="Alias for !stop.", inline=False)
-        embed.add_field(name="!loop", value="Toggles looping of the current song.", inline=False)
-        embed.add_field(name="!queue", value="Displays the current queue.", inline=False)
-        embed.add_field(name="!q", value="Alias for !queue.", inline=False)
-        embed.add_field(name="!skip", value="Skips the current song.", inline=False)
-        embed.add_field(name="!s", value="Alias for !skip.", inline=False)
-        embed.add_field(name="!np", value="Shows the current song playing.", inline=False)
-        embed.add_field(name="!lyrics", value="Fetches and displays the lyrics of the current song.", inline=False)
-        await ctx.send(embed=embed)
+    client.remove_command('help')
 
-    @play.error
-    @p.error
-    @clear.error
-    @pause.error
-    @resume.error
-    @stop.error
-    @fuckoff.error
-    @kys.error
-    @loop.error
-    @queue.error
-    @q.error
-    @skip.error
-    @s.error
-    @np.error
-    @lyrics.error
-    async def role_error(ctx, error):
-        if isinstance(error, commands.MissingRole):
-            embed = discord.Embed(title="Permission Denied", description=f"You do not have the required role: {ROLE_NAME}", color=discord.Color.red())
-            await ctx.send(embed=embed)
-        elif isinstance(error, commands.CheckFailure):
-            pass
+    @client.command(name="help")
+    async def help_command(ctx):
+        embed = discord.Embed(
+            title="🎵 MusicBot Help",
+            description="Here’s a list of all my commands:",
+            color=discord.Color.blurple()
+        )
+        embed.set_thumbnail(url=client.user.avatar.url)
+        embed.set_footer(text="Use <> for required, [] for optional")
+
+        # Play & Queue
+        embed.add_field(
+            name="▶️ !play <url|search>",
+            value="Plays a song from YouTube (by URL or search). Joins your VC if needed.",
+            inline=False
+        )
+        embed.add_field(
+            name="📜 !playlist <url>",
+            value="Queues an entire YouTube playlist.",
+            inline=False
+        )
+        embed.add_field(
+            name="🗒️ !queue",
+            value="Shows the current queue.",
+            inline=False
+        )
+        embed.add_field(
+            name="❌ !clear",
+            value="Clears the queue.",
+            inline=False
+        )
+
+        # Playback controls
+        embed.add_field(
+            name="⏸️ !pause",
+            value="Pauses playback.",
+            inline=False
+        )
+        embed.add_field(
+            name="▶️ !resume",
+            value="Resumes playback.",
+            inline=False
+        )
+        embed.add_field(
+            name="⏭️ !skip",
+            value="Skips the current song.",
+            inline=False
+        )
+        embed.add_field(
+            name="🔁 !loop",
+            value="Toggles looping for the current song.",
+            inline=False
+        )
+        embed.add_field(
+            name="⏹️ !stop",
+            value="Stops and disconnects the bot.",
+            inline=False
+        )
+
+        # Info & Extras
+        embed.add_field(
+            name="🎶 !np",
+            value="Shows what’s Now Playing.",
+            inline=False
+        )
+        embed.add_field(
+            name="📝 !lyrics",
+            value="Fetches lyrics for the current song.",
+            inline=False
+        )
+        embed.add_field(
+            name="🔊 !voicecheck",
+            value="Checks your & bot’s voice‑channel status and permissions.",
+            inline=False
+        )
+
+        await ctx.send(embed=embed)
 
     @client.command(name="playlist")
     @commands.has_role(ROLE_NAME)
@@ -401,6 +471,29 @@ def run_bot():
             print(f"Error processing playlist: {e}")
             embed = discord.Embed(title="Error", description="There was an error processing the playlist.", color=discord.Color.red())
             await ctx.send(embed=embed)
+
+    @client.command(name="voicecheck")
+    async def voicecheck(ctx):
+        user_vc = ctx.author.voice.channel if ctx.author.voice else None
+        bot_vc = ctx.guild.voice_client.channel if ctx.guild.voice_client else None
+
+        if user_vc:
+            perms = user_vc.permissions_for(ctx.guild.me)
+            can_connect = perms.connect
+            can_speak = perms.speak
+        else:
+            can_connect = can_speak = False
+
+        embed = discord.Embed(title="🔊 Voice Check", color=discord.Color.blue())
+        embed.add_field(name="🧑 You in Voice Channel", value="✅ Yes" if user_vc else "❌ No", inline=False)
+        embed.add_field(name="🤖 Bot in Voice Channel", value=f"✅ Yes ({bot_vc.name})" if bot_vc else "❌ No", inline=False)
+
+        if user_vc:
+            embed.add_field(name="🔐 Bot Permissions in Your Channel",
+                            value=f"Connect: {'✅' if can_connect else '❌'}\nSpeak: {'✅' if can_speak else '❌'}",
+                            inline=False)
+
+        await ctx.send(embed=embed)
 
     client.run(DISCORD_TOKEN)
 
