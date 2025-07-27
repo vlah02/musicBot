@@ -9,39 +9,53 @@ import urllib.parse, urllib.request, re
 import datetime
 import random
 
+def make_progress_bar(elapsed: float, total: float, length: int = 20) -> str:
+    """Return a text bar like '████░░░░░ 01:23/03:45'"""
+    filled = int(elapsed / total * length)
+    empty = length - filled
+    bar = "█" * filled + "░" * empty
+
+    def fmt(sec: float) -> str:
+        m, s = divmod(int(sec), 60)
+        return f"{m:02}:{s:02}"
+
+    return f"{bar} {fmt(elapsed)}/{fmt(total)}"
+
 def run_bot():
     load_dotenv()
-    DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-    GENIUS_TOKEN = os.getenv('GENIUS_TOKEN')
-    ROLE_NAME = "DJ"
-    RESTRICTED_USER_ID = 123456789012345678
+    DISCORD_TOKEN   = os.getenv('DISCORD_TOKEN')
+    GENIUS_TOKEN    = os.getenv('GENIUS_TOKEN')
+    ROLE_NAME       = "DJ"
+    RESTRICTED_UID  = 123456789012345678
 
     intents = discord.Intents.default()
     intents.message_content = True
-    intents.voice_states = True
+    intents.voice_states    = True
     client = commands.Bot(command_prefix="!", intents=intents)
 
-    queues = {}
-    voice_clients = {}
-    current_song = {}
-    song_start_times = {}
-    loop_status = {}
+    # State
+    queues          = {}  # guild_id -> list[song]
+    voice_clients   = {}  # guild_id -> VoiceClient
+    current_song    = {}  # guild_id -> song
+    song_start_times= {}  # guild_id -> datetime
+    loop_status     = {}  # guild_id -> bool
 
-    youtube_base_url = 'https://www.youtube.com/'
+    # YouTube / YTDL setup
+    youtube_base_url    = 'https://www.youtube.com/'
     youtube_results_url = youtube_base_url + 'results?'
-    youtube_watch_url = youtube_base_url + 'watch?v='
+    youtube_watch_url   = youtube_base_url + 'watch?v='
 
-    yt_dl_options = {
+    yt_dl_opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist"
     }
-    ytdl = yt_dlp.YoutubeDL(yt_dl_options)
-    genius = lyricsgenius.Genius(GENIUS_TOKEN)
+    ytdl    = yt_dlp.YoutubeDL(yt_dl_opts)
+    genius  = lyricsgenius.Genius(GENIUS_TOKEN)
 
-    ffmpeg_options = {
+    ffmpeg_opts = {
         'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
         'options': '-vn -filter:a "volume=0.25"'
     }
@@ -53,14 +67,55 @@ def run_bot():
     @client.event
     async def on_voice_state_update(member, before, after):
         # Clean up if bot is disconnected manually
-        if member == client.user and before.channel is not None and after.channel is None:
-            guild_id = before.channel.guild.id
-            print(f"[INFO] Bot was disconnected from voice channel in guild {guild_id}")
-            vc = voice_clients.pop(guild_id, None)
-            if vc:
-                vc.stop()
-            current_song.pop(guild_id, None)
-            song_start_times.pop(guild_id, None)
+        if member == client.user and before.channel and not after.channel:
+            gid = before.channel.guild.id
+            vc = voice_clients.pop(gid, None)
+            if vc: vc.stop()
+            current_song.pop(gid, None)
+            song_start_times.pop(gid, None)
+
+    @client.event
+    async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+        if user.bot:
+            return
+
+        msg = reaction.message
+        # Only care about our own "Now Playing" embed
+        if msg.author != client.user or not msg.embeds:
+            return
+        embed = msg.embeds[0]
+        if embed.title != "Now Playing":
+            return
+
+        # Control emojis
+        if reaction.emoji not in ("⏸️","▶️","➡️"):
+            return
+
+        gid = msg.guild.id
+        vc  = voice_clients.get(gid)
+        if not vc:
+            # remove reaction so user can retry
+            try: await msg.remove_reaction(reaction.emoji, user)
+            except discord.Forbidden: pass
+            return
+
+        # Handle controls
+        if reaction.emoji == "⏸️":
+            vc.pause()
+            await msg.channel.send("⏸️ Paused playback.")
+        elif reaction.emoji == "▶️":
+            vc.resume()
+            await msg.channel.send("▶️ Resumed playback.")
+        else:  # ➡️ skip
+            vc.stop()
+            await msg.channel.send("➡️ Skipped current song.")
+            # don't call handle_queue here—after callback will fire once
+
+        # remove user's reaction so they can press again
+        try:
+            await msg.remove_reaction(reaction.emoji, user)
+        except discord.Forbidden:
+            pass
 
     async def play_song(ctx, song):
         try:
@@ -69,24 +124,23 @@ def run_bot():
             )
         except Exception as e:
             print(f"Error extracting info: {e}")
-            await ctx.send(embed=discord.Embed(
+            return await ctx.send(embed=discord.Embed(
                 title="Error",
                 description="There was an error extracting the video information.",
                 color=discord.Color.red()
             ))
-            return
 
-        player = discord.FFmpegOpusAudio(data['url'], **ffmpeg_options)
+        player = discord.FFmpegOpusAudio(data['url'], **ffmpeg_opts)
 
-        def after_playing(err):
+        def after_play(err):
             vc = voice_clients.get(ctx.guild.id)
-            if vc is None or not vc.is_connected():
+            if not vc or not vc.is_connected():
                 return
             coro = play_song(ctx, song) if loop_status.get(ctx.guild.id) else handle_queue(ctx)
             asyncio.run_coroutine_threadsafe(coro, client.loop)
 
-        voice_clients[ctx.guild.id].play(player, after=after_playing)
-        current_song[ctx.guild.id] = song
+        voice_clients[ctx.guild.id].play(player, after=after_play)
+        current_song[ctx.guild.id]    = song
         song_start_times[ctx.guild.id] = datetime.datetime.now()
 
         embed = discord.Embed(title="Now Playing", color=discord.Color.green())
@@ -97,17 +151,17 @@ def run_bot():
         await ctx.send(embed=embed)
 
     async def handle_queue(ctx):
-        if queues.get(ctx.guild.id):
-            next_song = queues[ctx.guild.id].pop(0)
+        q = queues.get(ctx.guild.id)
+        if q:
+            next_song = q.pop(0)
             await play_song(ctx, next_song)
         else:
             await disconnect_bot(ctx)
 
     async def disconnect_bot(ctx):
-        if ctx.guild.id in voice_clients:
-            await voice_clients[ctx.guild.id].disconnect()
-            del voice_clients[ctx.guild.id]
-        current_song.pop(ctx.guild.id, None)
+        vc = voice_clients.pop(ctx.guild.id, None)
+        if vc:
+            await vc.disconnect()
         await ctx.send(embed=discord.Embed(
             title="Disconnected",
             description="The queue is empty. The bot has disconnected.",
@@ -116,7 +170,7 @@ def run_bot():
 
     @client.before_invoke
     async def check_restricted_user(ctx):
-        if ctx.author.id == RESTRICTED_USER_ID:
+        if ctx.author.id == RESTRICTED_UID:
             await ctx.send(embed=discord.Embed(
                 title="Access Denied",
                 description="You are restricted from using this command.",
@@ -129,29 +183,26 @@ def run_bot():
     async def play(ctx, *, link=None, user=None):
         queues.setdefault(ctx.guild.id, [])
         if link is None:
-            # Resume or show empty queue
-            if queues[ctx.guild.id]:
+            # resume or drain queue
+            q = queues[ctx.guild.id]
+            if q:
                 vc = voice_clients.get(ctx.guild.id)
                 if vc and vc.is_connected() and not vc.is_playing():
-                    song = queues[ctx.guild.id].pop(0)
-                    await play_song(ctx, song)
-                else:
-                    try:
-                        vc = await ctx.author.voice.channel.connect()
-                        voice_clients[ctx.guild.id] = vc
-                        song = queues[ctx.guild.id].pop(0)
-                        await play_song(ctx, song)
-                    except Exception as e:
-                        print(e)
-            else:
-                await ctx.send(embed=discord.Embed(title="Queue", description="The queue is empty.", color=discord.Color.red()))
-            return
+                    song = q.pop(0)
+                    return await play_song(ctx, song)
+                vc = await ctx.author.voice.channel.connect()
+                voice_clients[ctx.guild.id] = vc
+                song = q.pop(0)
+                return await play_song(ctx, song)
+            return await ctx.send(embed=discord.Embed(
+                title="Queue", description="The queue is empty.", color=discord.Color.red()
+            ))
 
-        # Search mode
-        if youtube_base_url not in link:
+        # search mode
+        if 'youtube.com' not in link:
             query = urllib.parse.urlencode({'search_query': link})
-            html = urllib.request.urlopen(youtube_results_url + query).read().decode()
-            m = re.search(r'/watch\?v=(.{11})', html)
+            html  = urllib.request.urlopen(youtube_results_url + query).read().decode()
+            m     = re.search(r'/watch\?v=(.{11})', html)
             if m:
                 link = youtube_watch_url + m.group(1)
 
@@ -161,10 +212,9 @@ def run_bot():
             )
         except Exception as e:
             print(f"Error extracting info: {e}")
-            await ctx.send(embed=discord.Embed(
+            return await ctx.send(embed=discord.Embed(
                 title="Error", description="Error extracting video info.", color=discord.Color.red()
             ))
-            return
 
         song = {
             'title': data['title'],
@@ -178,66 +228,23 @@ def run_bot():
         if vc and vc.is_connected():
             if vc.is_playing():
                 queues[ctx.guild.id].append(song)
-                await ctx.send(embed=discord.Embed(
+                return await ctx.send(embed=discord.Embed(
                     title="Added to Queue",
                     description=f"{song['title']} added at position {len(queues[ctx.guild.id])}.",
                     color=discord.Color.blue()
                 ))
             else:
-                await play_song(ctx, song)
-        else:
-            try:
-                vc = await ctx.author.voice.channel.connect()
-                voice_clients[ctx.guild.id] = vc
-                await play_song(ctx, song)
-            except Exception as e:
-                print(e)
+                return await play_song(ctx, song)
+
+        vc = await ctx.author.voice.channel.connect()
+        voice_clients[ctx.guild.id] = vc
+        await play_song(ctx, song)
 
     @client.command(name="p")
     @commands.has_role(ROLE_NAME)
     async def p(ctx, *, link=None):
         await play(ctx, link=link)
 
-    @client.command(name="clear")
-    @commands.has_role(ROLE_NAME)
-    async def clear(ctx):
-        if queues.get(ctx.guild.id):
-            queues[ctx.guild.id].clear()
-            await ctx.send(embed=discord.Embed(
-                title="Queue Cleared",
-                description="The queue has been cleared.",
-                color=discord.Color.orange()
-            ))
-        else:
-            await ctx.send(embed=discord.Embed(
-                title="Queue Error",
-                description="There is no queue to clear.",
-                color=discord.Color.red()
-            ))
-
-    @client.command(name="remove")
-    @commands.has_role(ROLE_NAME)
-    async def remove(ctx, position: int):
-        """Remove a song from the queue by its position."""
-        q = queues.get(ctx.guild.id)
-        if not q:
-            return await ctx.send(embed=discord.Embed(
-                title="Error",
-                description="The queue is empty.",
-                color=discord.Color.red()
-            ))
-        if position < 1 or position > len(q):
-            return await ctx.send(embed=discord.Embed(
-                title="Error",
-                description=f"Position must be between 1 and {len(q)}.",
-                color=discord.Color.red()
-            ))
-        removed = q.pop(position - 1)
-        await ctx.send(embed=discord.Embed(
-            title="Removed from Queue",
-            description=f"Removed **{removed['title']}** from position {position}.",
-            color=discord.Color.green()
-        ))
 
     @client.command(name="pause")
     @commands.has_role(ROLE_NAME)
@@ -311,14 +318,6 @@ def run_bot():
     async def s(ctx):
         await skip(ctx)
 
-    @client.command(name="loop")
-    @commands.has_role(ROLE_NAME)
-    async def loop(ctx):
-        loop_status[ctx.guild.id] = not loop_status.get(ctx.guild.id, False)
-        status = "enabled" if loop_status[ctx.guild.id] else "disabled"
-        embed = discord.Embed(title="Loop", description=f"Looping is now {status}.", color=discord.Color.purple())
-        await ctx.send(embed=embed)
-
     @client.command(name="queue")
     @commands.has_role(ROLE_NAME)
     async def queue_cmd(ctx):
@@ -343,23 +342,6 @@ def run_bot():
     @commands.has_role(ROLE_NAME)
     async def q(ctx):
         await queue_cmd(ctx)
-
-    @client.command(name="np")
-    @commands.has_role(ROLE_NAME)
-    async def np(ctx):
-        song = current_song.get(ctx.guild.id)
-        if song:
-            await ctx.send(embed=discord.Embed(
-                title="Now Playing",
-                description=f"[{song['title']}]({song['url']})",
-                color=discord.Color.green()
-            ))
-        else:
-            await ctx.send(embed=discord.Embed(
-                title="Now Playing",
-                description="No song is currently playing.",
-                color=discord.Color.red()
-            ))
 
     @client.command(name="lyrics")
     @commands.has_role(ROLE_NAME)
@@ -525,22 +507,20 @@ def run_bot():
     @client.command(name="search")
     @commands.has_role(ROLE_NAME)
     async def search(ctx, *, keywords):
-        # Perform a “ytsearch5:” lookup
-        data = ytdl.extract_info(f"ytsearch5:{keywords}", download=False)
+        data    = ytdl.extract_info(f"ytsearch5:{keywords}", download=False)
         entries = data.get("entries", [])
         if not entries:
             return await ctx.send("No results found.")
 
-        # Build embed with 1–5 choices, safely grabbing a URL
-        descriptions = []
+        lines = []
         for i, e in enumerate(entries, start=1):
-            url = e.get("webpage_url") or e.get("url") or (youtube_watch_url + e.get("id", ""))
-            title = e.get("title", "Unknown title")
-            descriptions.append(f"{i}. [{title}]({url})")
+            url = e.get("webpage_url") or e.get("url") or (youtube_watch_url + e.get("id",""))
+            title = e.get("title","Unknown")
+            lines.append(f"{i}. [{title}]({url})")
 
-        em = discord.Embed(
+        em  = discord.Embed(
             title=f"Results for “{keywords}”",
-            description="\n".join(descriptions),
+            description="\n".join(lines),
             color=discord.Color.gold()
         )
         msg = await ctx.send(embed=em)
@@ -549,40 +529,35 @@ def run_bot():
         for i in range(len(entries)):
             await msg.add_reaction(emojis[i])
 
-        def check(reaction, user):
-            return (
-                user == ctx.author
-                and reaction.message.id == msg.id
-                and reaction.emoji in emojis[:len(entries)]
-            )
+        def check(r,u):
+            return u==ctx.author and r.message.id==msg.id and r.emoji in emojis[:len(entries)]
 
         try:
-            reaction, user = await client.wait_for("reaction_add", timeout=30.0, check=check)
+            r,u = await client.wait_for("reaction_add", timeout=30.0, check=check)
         except asyncio.TimeoutError:
             return await ctx.send("❌ Selection timed out.")
 
-        idx = emojis.index(reaction.emoji)
-        pick = entries[idx]
-        pick_url = pick.get("webpage_url") or pick.get("url") or (youtube_watch_url + pick.get("id", ""))
+        idx      = emojis.index(r.emoji)
+        pick     = entries[idx]
+        pick_url = pick.get("webpage_url") or pick.get("url") or (youtube_watch_url+pick.get("id",""))
 
         song = {
-            'title': pick.get('title', 'Unknown'),
-            'url': pick_url,
-            'duration': pick.get('duration', 0),
+            'title': pick.get('title','Unknown'),
+            'url'  : pick_url,
+            'duration': pick.get('duration',0),
             'thumbnail': pick.get('thumbnail'),
             'user': ctx.author.display_name
         }
 
         gid = ctx.guild.id
-        q = queues.setdefault(gid, [])
-        vc = voice_clients.get(gid)
+        vc  = voice_clients.get(gid)
+        q   = queues.setdefault(gid, [])
         if vc and vc.is_connected() and vc.is_playing():
             q.append(song)
-            return await ctx.send(f"✅ Queued **{song['title']}** at position {len(q)}.")
-        else:
-            vc = await ctx.author.voice.channel.connect()
-            voice_clients[gid] = vc
-            await play_song(ctx, song)
+            return await ctx.send(f"✅ Queued **{song['title']}** at pos {len(q)}.")
+        vc = await ctx.author.voice.channel.connect()
+        voice_clients[gid] = vc
+        await play_song(ctx, song)
 
     @client.command(name="shuffle")
     @commands.has_role(ROLE_NAME)
@@ -590,16 +565,78 @@ def run_bot():
         q = queues.get(ctx.guild.id)
         if not q:
             return await ctx.send(embed=discord.Embed(
-                title="Error",
-                description="Queue empty.",
-                color=discord.Color.red()
+                title="Error", description="Queue empty.", color=discord.Color.red()
             ))
         random.shuffle(q)
         await ctx.send(embed=discord.Embed(
-            title="🔀 Shuffled",
-            description="Queue order randomized!",
-            color=discord.Color.purple()
+            title="🔀 Shuffled", description="Queue randomized!", color=discord.Color.purple()
         ))
+
+    @client.command(name="clear")
+    @commands.has_role(ROLE_NAME)
+    async def clear(ctx):
+        if queues.get(ctx.guild.id):
+            queues[ctx.guild.id].clear()
+            await ctx.send(embed=discord.Embed(
+                title="Queue Cleared", description="Queue cleared!", color=discord.Color.orange()
+            ))
+        else:
+            await ctx.send(embed=discord.Embed(
+                title="Queue Error", description="No queue to clear.", color=discord.Color.red()
+            ))
+
+    @client.command(name="remove")
+    @commands.has_role(ROLE_NAME)
+    async def remove(ctx, position: int):
+        q = queues.get(ctx.guild.id)
+        if not q:
+            return await ctx.send(embed=discord.Embed(
+                title="Error", description="Queue is empty.", color=discord.Color.red()
+            ))
+        if position<1 or position>len(q):
+            return await ctx.send(embed=discord.Embed(
+                title="Error", description=f"Pos must be 1–{len(q)}.", color=discord.Color.red()
+            ))
+        song = q.pop(position-1)
+        await ctx.send(embed=discord.Embed(
+            title="Removed", description=f"Removed **{song['title']}** from pos {position}.",
+            color=discord.Color.green()
+        ))
+
+    @client.command(name="loop")
+    @commands.has_role(ROLE_NAME)
+    async def loop(ctx):
+        loop_status[ctx.guild.id] = not loop_status.get(ctx.guild.id, False)
+        status = "enabled" if loop_status[ctx.guild.id] else "disabled"
+        await ctx.send(embed=discord.Embed(
+            title="Loop", description=f"Looping {status}.", color=discord.Color.purple()
+        ))
+
+    @client.command(name="np")
+    @commands.has_role(ROLE_NAME)
+    async def np(ctx):
+        """Show now playing + progress + reactions."""
+        song = current_song.get(ctx.guild.id)
+        start= song_start_times.get(ctx.guild.id)
+        if not song or not start:
+            return await ctx.send(embed=discord.Embed(
+                title="Now Playing", description="No song playing.", color=discord.Color.red()
+            ))
+
+        total   = song['duration']
+        elapsed = (datetime.datetime.now()-start).total_seconds()
+        if elapsed>total: elapsed = total
+
+        embed = discord.Embed(title="Now Playing", color=discord.Color.green())
+        embed.add_field(name="Title", value=f"[{song['title']}]({song['url']})", inline=False)
+        embed.add_field(name="Duration", value=str(datetime.timedelta(seconds=total)), inline=False)
+        embed.add_field(name="Requested by", value=song['user'], inline=False)
+        embed.add_field(name="Progress", value=make_progress_bar(elapsed, total), inline=False)
+        embed.set_thumbnail(url=song['thumbnail'])
+
+        msg = await ctx.send(embed=embed)
+        for emoji in ("⏸️","▶️","➡️"):
+            await msg.add_reaction(emoji)
 
     client.run(DISCORD_TOKEN)
 
