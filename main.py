@@ -261,59 +261,66 @@ def run_bot():
     @client.command(name="search")
     @commands.has_role(ROLE_NAME)
     async def search(ctx, *, keywords):
-        data    = ytdl.extract_info(f"ytsearch5:{keywords}", download=False)
+        data = ytdl.extract_info(f"ytsearch5:{keywords}", download=False)
         entries = data.get("entries", [])
         if not entries:
             return await ctx.send("No results found.")
+
         lines = [
-            f"{i}. [{e.get('title','Unknown')}]({e.get('webpage_url') or e.get('url') or (youtube_watch_url + e.get('id',''))})"
+            f"{i}. [{e.get('title', 'Unknown')}]({e.get('webpage_url') or e.get('url') or (youtube_watch_url + e.get('id', ''))})"
             for i, e in enumerate(entries, start=1)
         ]
-        em  = discord.Embed(
+        em = discord.Embed(
             title=f"Results for “{keywords}”",
             description="\n".join(lines),
             color=discord.Color.gold()
         )
         msg = await ctx.send(embed=em)
-        emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
+
+        emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
         for i in range(len(entries)):
             await msg.add_reaction(emojis[i])
 
         def check(r, u):
-            return u == ctx.author and r.message.id == msg.id and r.emoji in emojis[:len(entries)]
+            return (
+                    u == ctx.author
+                    and r.message.id == msg.id
+                    and r.emoji in emojis[:len(entries)]
+            )
 
         try:
-            reaction, user = await client.wait_for("reaction_add", timeout=30.0, check=check)
+            reaction, user = await client.wait_for(
+                "reaction_add", timeout=30.0, check=check
+            )
         except asyncio.TimeoutError:
             return await ctx.send("❌ Selection timed out.")
 
-        idx      = emojis.index(reaction.emoji)
-        pick     = entries[idx]
-        pick_url = pick.get("webpage_url") or pick.get("url") or (youtube_watch_url + pick.get("id",""))
-        song     = {
-            "title": pick.get("title","Unknown"),
-            "url"  : pick_url,
-            "duration": pick.get("duration",0),
+        try:
+            await msg.delete()
+        except:
+            pass
+
+        idx = emojis.index(reaction.emoji)
+        pick = entries[idx]
+        pick_url = pick.get("webpage_url") or pick.get("url") or (
+                youtube_watch_url + pick.get("id", "")
+        )
+        song = {
+            "title": pick.get("title", "Unknown"),
+            "url": pick_url,
+            "duration": pick.get("duration", 0),
             "thumbnail": pick.get("thumbnail"),
             "user": ctx.author.display_name,
         }
 
         gid = ctx.guild.id
-        vc  = voice_clients.get(gid)
-        q   = queues.setdefault(gid, [])
+        vc = voice_clients.get(gid)
+        q = queues.setdefault(gid, [])
         if vc and vc.is_connected() and vc.is_playing():
             q.append(song)
-            try:
-                await msg.remove_reaction(reaction.emoji, user)
-            except discord.Forbidden:
-                pass
             return await ctx.send(f"✅ Queued **{song['title']}** at position {len(q)}.")
         vc = await ctx.author.voice.channel.connect()
         voice_clients[gid] = vc
-        try:
-            await msg.remove_reaction(reaction.emoji, user)
-        except discord.Forbidden:
-            pass
         await play_song(ctx, song)
 
     @client.command(name="shuffle")
