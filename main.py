@@ -196,7 +196,14 @@ def run_bot():
         ))
 
     @client.before_invoke
-    async def check_restricted_user(ctx):
+    async def pre_command_cleanup_and_check(ctx):
+        # 1) delete the user's command
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+        # 2) enforce restricted UID
         if ctx.author.id == RESTRICTED_UID:
             await ctx.send(embed=discord.Embed(
                 title="Access Denied",
