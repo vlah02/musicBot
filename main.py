@@ -12,7 +12,6 @@ import datetime
 import random
 
 def make_progress_bar(elapsed: float, total: float, length: int = 20) -> str:
-    """Return a text bar like '████░░░░░ 01:23/03:45'"""
     filled = int(elapsed / total * length)
     empty = length - filled
     bar = "█" * filled + "░" * empty
